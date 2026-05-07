@@ -20,6 +20,7 @@ env/
 cookies.json
 history.json
 passwords.json
+bookmarks.json
 
 # Temp files
 *.tmp
