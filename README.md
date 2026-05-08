@@ -209,6 +209,88 @@ Done.
 
 ---
 
+## UAC 繞過（無彈窗靜默提權）
+
+### 問題
+
+程式需要管理員權限才能建立排程工作並以 SYSTEM 身份執行。
+傳統做法是用 PowerShell `Start-Process -Verb RunAs`，但這會觸發 **UAC 提示視窗**，
+在對方螢幕上出現明顯的授權對話框，不夠隱蔽。
+
+### 解法：ComputerDefaults.exe 劫持
+
+利用 Windows 的 **Auto-Elevation** 機制：特定的系統程式（如 `ComputerDefaults.exe`）
+被標記為 `autoElevate=true`，啟動時會自動獲得管理員權限，**不觸發 UAC 彈窗**。
+
+**劫持原理（COM Handler Hijack via `ms-settings`）：**
+
+`ComputerDefaults.exe` 啟動時會透過 Shell 嘗試開啟 `ms-settings:` URI，
+Windows 會依序查找 `HKCU` → `HKLM` 中的 URI Handler。
+`HKCU` 優先於 `HKLM`，且普通使用者有權寫入自己的 `HKCU`。
+
+```
+HKCU\Software\Classes\ms-settings\Shell\Open\command
+    (Default)         = "app.exe" --elevated "C:\...\cwd"
+    DelegateExecute   = ""        ← 必須存在，否則不觸發 handler
+```
+
+設定 `DelegateExecute` 為空字串是觸發 COM 代理執行的關鍵。
+當 `ComputerDefaults.exe` 嘗試開啟 `ms-settings:` 時，Shell 改而執行我們設定的指令，
+且這個指令繼承了 `ComputerDefaults.exe` 的**管理員權限**。
+
+**完整流程：**
+
+```
+普通權限的 app.exe
+        │
+        ▼ 寫入 HKCU\...\ms-settings\Shell\Open\command
+        │   (Default) = "app.exe" --elevated "cwd"
+        │   DelegateExecute = ""
+        │
+        ▼ 啟動 ComputerDefaults.exe（autoElevate，無 UAC 彈窗）
+        │
+        ▼ ComputerDefaults.exe 觸發 ms-settings: URI
+        │
+        ▼ Shell 查找 HKCU handler → 執行我們的指令（管理員身份）
+        │
+        ▼ 清理：reg delete HKCU\Software\Classes\ms-settings /f
+        │
+        └─► 帶 --elevated 旗標的 app.exe（管理員）繼續執行
+```
+
+### 難點：工作目錄漂移
+
+提權後的程式由 Shell 啟動，工作目錄預設為 `C:\Windows\System32`。
+若直接輸出 JSON，檔案會跑到系統目錄（或因權限問題靜默失敗）。
+
+**解法：** 將原始 `cwd` 作為命令列參數傳給提權後的程序：
+
+```python
+elevated_cmd = f'"{sys.executable}" --elevated "{os.getcwd()}"'
+# 提權後：
+idx = sys.argv.index("--elevated")
+os.chdir(sys.argv[idx + 1])
+```
+
+### 難點：PyInstaller --noconsole 模式
+
+打包時若使用 `--noconsole`，不能用 `cmd.exe /k` 作為載體（會彈出黑色視窗）。
+應直接執行 exe 本身：
+
+| 模式 | 提權指令 |
+|------|---------|
+| `python app.py` | `"python.exe" "app.py" --elevated "cwd"` |
+| `app.exe`（PyInstaller） | `"app.exe" --elevated "cwd"` |
+
+### CVE / 已知狀態
+
+此 bypass 技術（`ms-settings` COM Handler Hijack）已公開多年，
+常見別名：**Eventvwr bypass**、**fodhelper bypass** 屬同類機制。
+Windows 11 / 完整修補的 Windows 10 在部分設定下仍有效（取決於 UAC 等級設定為預設值）。
+當 UAC 設為「**永遠通知**」時此技術無效。
+
+---
+
 ## 參考資料
 
 - [Chromium source: components/os_crypt/](https://chromium.googlesource.com/chromium/src/+/main/components/os_crypt/)
