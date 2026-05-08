@@ -258,7 +258,7 @@ HKCU\Software\Classes\ms-settings\Shell\Open\command
         └─► 帶 --elevated 旗標的 app.exe（管理員）繼續執行
 ```
 
-### 難點：工作目錄漂移
+### 問題：工作目錄漂移
 
 提權後的程式由 Shell 啟動，工作目錄預設為 `C:\Windows\System32`。
 若直接輸出 JSON，檔案會跑到系統目錄（或因權限問題靜默失敗）。
@@ -272,7 +272,7 @@ idx = sys.argv.index("--elevated")
 os.chdir(sys.argv[idx + 1])
 ```
 
-### 難點：PyInstaller --noconsole 模式
+### 問題：PyInstaller --noconsole 模式
 
 打包時若使用 `--noconsole`，不能用 `cmd.exe /k` 作為載體（會彈出黑色視窗）。
 應直接執行 exe 本身：
